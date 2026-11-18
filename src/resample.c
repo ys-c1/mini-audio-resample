@@ -47,6 +47,17 @@ static int ensure_history(Resampler *rs, size_t extra)
     return 0;
 }
 
+static float clamp_sample(float value)
+{
+    if (value > 1.0f) {
+        return 1.0f;
+    }
+    if (value < -1.0f) {
+        return -1.0f;
+    }
+    return value;
+}
+
 static const float *frame_at(const Resampler *rs, long long index)
 {
     long long offset;
@@ -120,13 +131,7 @@ int resample_init(Resampler *rs, double in_rate, double out_rate, int channels)
 
     rs->in_rate = in_rate;
     rs->out_rate = out_rate;
-    {
-        int step_frames = (int)(in_rate / out_rate);
-        if (step_frames < 1) {
-            step_frames = 1;
-        }
-        rs->step = (double)step_frames;
-    }
+    rs->step = in_rate / out_rate;
     if (!isfinite(rs->step) || rs->step <= 0.0) {
         return -1;
     }
@@ -196,7 +201,8 @@ int resample_process(Resampler *rs, const float *in, int in_frames,
 
         for (ch = 0; ch < rs->channels; ++ch) {
             float value = a[ch] + (float)frac * (b[ch] - a[ch]);
-            out[produced * (size_t)rs->channels + (size_t)ch] = value;
+            out[produced * (size_t)rs->channels + (size_t)ch] =
+                clamp_sample(value);
         }
         rs->pos += rs->step;
         rs->total_out++;
@@ -210,6 +216,10 @@ int resample_process(Resampler *rs, const float *in, int in_frames,
 
 int resample_flush(Resampler *rs, float *out, int out_cap, int *out_frames)
 {
+    long long target;
+    long long last;
+    size_t produced = 0;
+
     if (rs == NULL || !rs->initialized || out_frames == NULL) {
         return -1;
     }
@@ -220,7 +230,35 @@ int resample_flush(Resampler *rs, float *out, int out_cap, int *out_frames)
     if (out_cap > 0 && out == NULL) {
         return -1;
     }
+    if (rs->total_in <= 0) {
+        return 0;
+    }
 
-    (void)out;
+    target = target_output_frames(rs);
+    last = rs->total_in - 1;
+    while (produced < (size_t)out_cap && rs->total_out < target) {
+        long long index = (long long)floor(rs->pos);
+        double frac = rs->pos - (double)index;
+        long long ia = index < last ? index : last;
+        long long ib = index + 1 < last ? index + 1 : last;
+        const float *a = frame_at(rs, ia);
+        const float *b = frame_at(rs, ib);
+        int ch;
+
+        if (a == NULL || b == NULL) {
+            break;
+        }
+        /* Past the final input frame the tail extends the last sample. */
+        for (ch = 0; ch < rs->channels; ++ch) {
+            float value = a[ch] + (float)frac * (b[ch] - a[ch]);
+            out[produced * (size_t)rs->channels + (size_t)ch] =
+                clamp_sample(value);
+        }
+        rs->pos += rs->step;
+        rs->total_out++;
+        produced++;
+    }
+
+    *out_frames = (int)produced;
     return 0;
 }
